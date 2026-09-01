@@ -1,5 +1,6 @@
 package com.turnstile.inventory;
 
+import com.turnstile.common.InventoryMetrics;
 import com.turnstile.common.SeatUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,13 +21,16 @@ public class InventoryService {
 
     private final SeatRepository seats;
     private final HoldRepository holds;
+    private final InventoryMetrics metrics;
     private final Duration holdTtl;
 
     public InventoryService(SeatRepository seats,
                             HoldRepository holds,
+                            InventoryMetrics metrics,
                             @Value("${turnstile.hold.ttl:PT5M}") Duration holdTtl) {
         this.seats = seats;
         this.holds = holds;
+        this.metrics = metrics;
         this.holdTtl = holdTtl;
     }
 
@@ -42,6 +46,11 @@ public class InventoryService {
      */
     @Transactional
     public Hold hold(UUID seatId, UUID userId, String idempotencyKey) {
+        // From here on this request owns a pooled database connection for the
+        // duration of the transaction. That is the resource the Redis fast path
+        // exists to protect, so it is counted here rather than per statement.
+        metrics.recordPostgresRequest();
+
         // 1. Idempotent replay: the same key always yields the same hold.
         //
         //    KNOWN GAP (M1): two *simultaneous* requests carrying the same key can
