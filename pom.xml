@@ -19,6 +19,15 @@
 
     <properties>
         <java.version>21</java.version>
+
+        <!--
+            Spring Boot 3.3.5 pins Testcontainers 1.19.8, which ships docker-java 3.3.x.
+            That client negotiates Docker API 1.32, and Docker Engine 29 (API 1.53)
+            dropped support for anything below 1.44 - so every container start fails
+            with an opaque HTTP 400 carrying an empty Info body. Pinning the newest
+            1.x line picks up docker-java 3.4.x and modern API negotiation.
+        -->
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <dependencies>

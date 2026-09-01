@@ -44,6 +44,25 @@ mvn test -Dtest=SeatContentionTest
 mvn spring-boot:run
 ```
 
+### Troubleshooting: "Could not find a valid Docker environment"
+
+Testcontainers talks to `/var/run/docker.sock` directly. Recent Docker Desktop
+releases ship with *Allow the default Docker socket to be used* turned off, so
+that path exists but is not wired to the engine — it answers with an empty
+HTTP 400, while the `docker` CLI works fine because it follows the Docker
+context instead.
+
+Either enable **Settings -> Advanced -> Allow the default Docker socket to be
+used**, or point the JVM at the real socket:
+
+```bash
+export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
+export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+```
+
+The second variable is needed because Ryuk (the Testcontainers cleanup sidecar)
+mounts the socket into its own container.
+
 Claim a seat:
 
 ```bash
