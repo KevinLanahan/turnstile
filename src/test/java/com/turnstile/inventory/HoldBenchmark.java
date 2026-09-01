@@ -64,10 +64,15 @@ class HoldBenchmark extends AbstractIntegrationTest {
     @Autowired
     private InventoryMetrics metrics;
 
+    @Autowired
+    private SeatAvailabilityCache availability;
+
     private record Result(
             String scenario,
             int attempts,
-            long postgresRoundTrips,
+            long postgresRequests,
+            long fastPathRejections,
+            long failOpens,
             int successes,
             int conflicts,
             long wallMillis,
@@ -101,7 +106,9 @@ class HoldBenchmark extends AbstractIntegrationTest {
      * holds against a random seat from the pool, all released simultaneously.
      */
     private Result runScenario(String name, List<UUID> pool, int attemptsPerThread) throws Exception {
+        System.out.printf("  running %s (%d attempts)...%n", name, THREADS * attemptsPerThread);
         metrics.reset();
+        long failOpensBefore = availability.failOpenCount();
 
         CountDownLatch startGate = new CountDownLatch(1);
         AtomicInteger successes = new AtomicInteger();
@@ -155,6 +162,8 @@ class HoldBenchmark extends AbstractIntegrationTest {
                 name,
                 attempts,
                 metrics.postgresRequests(),
+                metrics.fastPathRejections(),
+                availability.failOpenCount() - failOpensBefore,
                 successes.get(),
                 conflicts.get(),
                 TimeUnit.NANOSECONDS.toMillis(wallNanos),
@@ -181,21 +190,24 @@ class HoldBenchmark extends AbstractIntegrationTest {
            .append(", ").append(Runtime.getRuntime().availableProcessors()).append(" cores, ")
            .append("Postgres 16 in Docker, Hikari pool 32, ")
            .append(THREADS).append(" virtual threads.\n\n");
-        out.append("| Scenario | Attempts | PG round-trips | Won | Lost | Wall (ms) | Throughput/s | p50 | p95 | p99 |\n");
-        out.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+        out.append("| Scenario | Attempts | PG requests | Shed by Redis | Fail-opens | Won | Lost | Wall (ms) | Throughput/s | p50 | p95 | p99 |\n");
+        out.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
         for (Result r : results) {
             out.append(String.format(
-                    "| %s | %d | %d | %d | %d | %d | %.0f | %.1f ms | %.1f ms | %.1f ms |%n",
-                    r.scenario(), r.attempts(), r.postgresRoundTrips(),
-                    r.successes(), r.conflicts(),
+                    "| %s | %d | %d | %d | %d | %d | %d | %d | %.0f | %.1f ms | %.1f ms | %.1f ms |%n",
+                    r.scenario(), r.attempts(), r.postgresRequests(), r.fastPathRejections(),
+                    r.failOpens(), r.successes(), r.conflicts(),
                     r.wallMillis(), r.throughputPerSec(),
                     r.p50Micros() / 1000.0, r.p95Micros() / 1000.0, r.p99Micros() / 1000.0));
         }
-        out.append("\n**PG round-trips** is the number that matters: requests that consumed a\n");
+        out.append("\n**PG requests** is the number that matters: requests that consumed a\n");
         out.append("pooled database connection. Latency figures include time queued for a\n");
         out.append("connection (pool size 32, offered concurrency 500), so they describe what\n");
         out.append("500 simultaneous users experience - not query execution time.\n\n");
-        out.append("Absolute timings are laptop-specific. Compare runs on one machine, never machines.\n");
+        out.append("Absolute timings are laptop-specific. Compare runs on one machine, never machines.\n\n");
+        out.append("**Fail-opens must be 0 for a run to mean anything.** A non-zero count means\n");
+        out.append("Redis was unhealthy and requests fell through to Postgres, so the shed column\n");
+        out.append("understates what a working fast path would do. Treat such a run as void.\n");
         System.out.println(out);
     }
 

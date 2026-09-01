@@ -18,7 +18,7 @@ That sentence is the entire project. Everything in this repo serves it.
 |---|---|---|
 | M0 | Project skeleton, Docker Compose, migrations, Testcontainers | done |
 | M1 | Atomic seat claim, 500-thread contention test, repository contract tests | done |
-| M2 | Redis fast path (Lua), before/after benchmark | next |
+| M2 | Redis fast path (Lua), before/after benchmark | done |
 | M3 | Hold expiry, state machine, confirm-vs-expire race test | planned |
 | M4 | Payment ledger, idempotency, transactional outbox | planned |
 | M5 | k6 load test, chaos tests, reconciliation job | planned |
@@ -144,30 +144,67 @@ Both run against real Postgres via Testcontainers. Not H2, not a mock. The proje
 turns on exact Postgres locking semantics, and a database with different
 concurrency behaviour would happily let broken code pass.
 
-## Performance baseline (M2, database only)
+## Performance: what the Redis fast path bought (M2)
 
-Measured before Redis existed, so the M2 comparison has something honest to be
-measured against. Run it yourself with `mvn test -Pbenchmark`.
+Both runs used the same harness on the same laptop, minutes apart, with one
+variable changed. Reproduce with `mvn test -Pbenchmark`.
 
-Java 25, 8 cores, Postgres 16 in Docker, Hikari pool 32, 500 virtual threads.
+Java 25, 8 cores, Postgres 16 and Redis 7 in Docker, Hikari pool 32, 500 virtual
+threads.
+
+**Before — Postgres only**
 
 | Scenario | Attempts | PG requests | Won | Lost | Wall (ms) | Throughput/s | p50 | p95 | p99 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| SELLOUT (20k seats, 500 threads x 40) | 20,000 | 20,000 | 12,616 | 7,384 | 10,764 | 1,858 | 19.3 ms | 1271.3 ms | 2539.0 ms |
-| DOOMED (1 held seat, 500 threads x 200) | 100,000 | 100,000 | 0 | 100,000 | 41,412 | 2,415 | 11.9 ms | 991.9 ms | 2658.7 ms |
+| SELLOUT (20k seats, 500 x 40) | 20,000 | 20,000 | 12,616 | 7,384 | 10,764 | 1,858 | 19.3 ms | 1271.3 ms | 2539.0 ms |
+| DOOMED (1 held seat, 500 x 200) | 100,000 | 100,000 | 0 | 100,000 | 41,412 | 2,415 | 11.9 ms | 991.9 ms | 2658.7 ms |
 
-**Read the PG requests column, not the milliseconds.** It is one-to-one with
-attempts: every request, including the 100,000 that were doomed from the start,
-consumed one of 32 pooled database connections in order to be told no. That is
-the waste the Redis fast path targets, and because it is a count rather than a
-duration it reproduces on any machine. The timings do not - they belong to this
-laptop.
+**After — Redis fast path in front**
 
-The latency distribution is worth a note of its own: p50 of 11.9 ms against a p99
-of 2.66 s. That spread is not the database. It is HikariCP's thread-local
-connection cache under 500-way oversubscription of a 32-connection pool - a thread
-that has just released a connection frequently reacquires it immediately, while
-others starve at the back of the queue. The pool is fast, not fair.
+| Scenario | Attempts | PG requests | Shed by Redis | Fail-opens | Won | Lost | Wall (ms) | Throughput/s | p50 | p95 | p99 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| SELLOUT (20k seats, 500 x 40) | 20,000 | 12,654 | 7,346 | 0 | 12,654 | 7,346 | 12,948 | 1,545 | 294.4 ms | 925.2 ms | 1478.8 ms |
+| DOOMED (1 held seat, 500 x 200) | 100,000 | **0** | 100,000 | 0 | 0 | 100,000 | 2,790 | 35,838 | 6.4 ms | 46.2 ms | 131.1 ms |
+
+### What this actually shows
+
+**Under pure contention the fast path is transformative.** All 100,000 doomed
+requests were rejected without touching Postgres at all - not fewer round trips,
+none. Throughput rose 14.8x (2,415 to 35,838/s) and p99 fell from 2.66 s to
+131 ms. The database was never the bottleneck for those requests; the connection
+pool was, and requests that never ask for a connection never queue for one.
+
+**Under a sellout it is a net loss on throughput, and that is not a bug.**
+Throughput fell 17% and median latency went from 19 ms to 294 ms. In SELLOUT
+about 63% of requests are winners who must reach Postgres regardless, so they now
+pay a Redis round trip *on top of* the full database cost. A cache only pays for
+itself on the requests it can reject.
+
+Note that the tail still improved even there - p95 down 27%, p99 down 42% -
+because the 37% that were shed stopped competing for connections. Median gets
+worse, tail gets better. Both are true at once.
+
+**So the fast path is a bet on the doom ratio.** It is the right bet for a ticket
+on-sale, where a popular event has thousands of people chasing each seat and
+almost every request is hopeless. It is the wrong bet for steady-state browsing
+of a half-empty venue. A production version would enable it per event, or adapt
+to the observed rejection rate, rather than applying it unconditionally as this
+one does.
+
+### On the numbers
+
+The **PG requests** and **shed** columns are counts, so they reproduce on any
+machine. The millisecond figures do not - they belong to this laptop, running
+Postgres and Redis inside Docker Desktop's VM, and they include time queued for a
+connection (pool size 32, offered concurrency 500). Quote the ratio, never the
+absolute.
+
+**Fail-opens must be 0 for a run to count.** A non-zero value means Redis was
+unhealthy and requests fell through to Postgres, which would make the shed column
+understate a working fast path. The column exists because an early run silently
+did exactly that - a 200 ms Redis command timeout under 500-way concurrency
+produced a flood of timeouts, every one of them correctly failing open, and the
+resulting table looked entirely plausible.
 
 ## Layout
 

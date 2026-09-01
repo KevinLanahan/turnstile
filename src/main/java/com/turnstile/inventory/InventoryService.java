@@ -2,90 +2,72 @@ package com.turnstile.inventory;
 
 import com.turnstile.common.InventoryMetrics;
 import com.turnstile.common.SeatUnavailableException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
-import java.time.Instant;
-import java.util.Optional;
 import java.util.UUID;
 
+/**
+ * Entry point for taking a hold on a seat.
+ *
+ * <p>Two layers, with very different jobs:
+ *
+ * <ol>
+ *   <li>{@link SeatAvailabilityCache} - advisory, in Redis, deliberately not
+ *       authoritative. It exists to reject hopeless requests cheaply. In a flash
+ *       sale most requests are hopeless, and each one that reaches Postgres burns
+ *       a pooled connection to be told no.</li>
+ *   <li>{@link HoldWriter} - authoritative, in Postgres, inside a transaction.
+ *       Nothing is true until this layer says so.</li>
+ * </ol>
+ *
+ * <p>Note that this method is <b>not</b> {@code @Transactional}. That is the
+ * point: the transaction, and with it a pooled database connection, must not be
+ * acquired until after the fast path has had its say.
+ */
 @Service
 public class InventoryService {
 
-    private static final Logger log = LoggerFactory.getLogger(InventoryService.class);
-
-    private final SeatRepository seats;
-    private final HoldRepository holds;
+    private final SeatAvailabilityCache availability;
+    private final HoldWriter holdWriter;
     private final InventoryMetrics metrics;
     private final Duration holdTtl;
 
-    public InventoryService(SeatRepository seats,
-                            HoldRepository holds,
+    public InventoryService(SeatAvailabilityCache availability,
+                            HoldWriter holdWriter,
                             InventoryMetrics metrics,
                             @Value("${turnstile.hold.ttl:PT5M}") Duration holdTtl) {
-        this.seats = seats;
-        this.holds = holds;
+        this.availability = availability;
+        this.holdWriter = holdWriter;
         this.metrics = metrics;
         this.holdTtl = holdTtl;
     }
 
     /**
-     * Claims a seat for a user, or fails cleanly if somebody else got it first.
-     *
-     * <p>Ordering here is deliberate. The seat claim happens BEFORE the hold row
-     * is written, so the row lock on {@code seats} is what serialises concurrent
-     * callers. If the claim fails we throw, the transaction rolls back, and no
-     * hold row is left behind.
-     *
-     * @throws SeatUnavailableException if the seat was not AVAILABLE
+     * @throws SeatUnavailableException if the seat is already spoken for
      */
-    @Transactional
     public Hold hold(UUID seatId, UUID userId, String idempotencyKey) {
+        ClaimVerdict verdict = availability.tryClaim(seatId, idempotencyKey, holdTtl);
+
+        if (verdict == ClaimVerdict.UNAVAILABLE) {
+            metrics.recordFastPathRejection();
+            throw new SeatUnavailableException(seatId);
+        }
+
         // From here on this request owns a pooled database connection for the
-        // duration of the transaction. That is the resource the Redis fast path
-        // exists to protect, so it is counted here rather than per statement.
+        // duration of the transaction. That is the scarce resource the fast path
+        // above exists to protect, so it is counted at this boundary.
         metrics.recordPostgresRequest();
 
-        // 1. Idempotent replay: the same key always yields the same hold.
-        //
-        //    KNOWN GAP (M1): two *simultaneous* requests carrying the same key can
-        //    both miss this read. The loser is caught by the unique index below and
-        //    currently surfaces as a 409 rather than as a replay. Postgres aborts the
-        //    transaction on constraint violation, so we cannot simply re-read here -
-        //    the real fix is INSERT ... ON CONFLICT DO NOTHING RETURNING, which lands
-        //    in M4 alongside payment idempotency.
-        Optional<Hold> replay = holds.findByIdempotencyKey(idempotencyKey);
-        if (replay.isPresent()) {
-            log.debug("Idempotent replay for key {} -> hold {}", idempotencyKey, replay.get().id());
-            return replay.get();
-        }
-
-        UUID holdId = UUID.randomUUID();
-
-        // 2. The atomic claim. This is the whole ballgame.
-        int claimed = seats.tryHold(seatId, holdId);
-        if (claimed == 0) {
-            throw new SeatUnavailableException(seatId);
-        }
-
-        // 3. Record the hold. The partial unique index on (seat_id) WHERE state='ACTIVE'
-        //    is a backstop: if it ever fires, the claim above and the holds table have
-        //    drifted apart, and we would rather fail the request than oversell.
-        Instant now = Instant.now();
-        Hold hold = new Hold(holdId, seatId, userId, HoldState.ACTIVE, idempotencyKey, now, now.plus(holdTtl));
         try {
-            holds.insert(hold);
-        } catch (DuplicateKeyException ex) {
-            log.warn("Hold insert rejected by a unique constraint for seat {} (key={})", seatId, idempotencyKey, ex);
-            throw new SeatUnavailableException(seatId);
+            return holdWriter.claim(seatId, userId, idempotencyKey, holdTtl);
+        } catch (RuntimeException ex) {
+            // Postgres disagreed with the cache, or the write failed. Either way the
+            // mark we may have just placed is not backed by a real hold, so drop it
+            // rather than shedding legitimate traffic until its TTL expires.
+            availability.release(seatId, idempotencyKey);
+            throw ex;
         }
-
-        log.debug("Seat {} held by user {} until {}", seatId, userId, hold.expiresAt());
-        return hold;
     }
 }
