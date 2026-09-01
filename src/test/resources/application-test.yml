@@ -1,0 +1,13 @@
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 32
+      connection-timeout: 30000
+  flyway:
+    enabled: true
+
+logging:
+  level:
+    com.turnstile: INFO
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN
