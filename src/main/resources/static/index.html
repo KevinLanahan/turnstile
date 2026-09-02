@@ -199,8 +199,12 @@ async function refreshSeats() {
   const total = map.seats.length;
   const avail = map.seats.filter(s => s.status === 'AVAILABLE').length;
   const sold  = map.seats.filter(s => s.status === 'BOOKED').length;
+  // Revenue is read straight off the ledger's account_balances view, not from a
+  // stored total. If this disagrees with what you have bought, the entries are wrong.
+  const revenue = (map.revenueCents / 100).toFixed(2);
   $('counts').innerHTML =
-    `<b>${avail}</b> available &nbsp;·&nbsp; <b>${total - avail - sold}</b> held &nbsp;·&nbsp; <b>${sold}</b> sold`;
+    `<b>${avail}</b> available &nbsp;·&nbsp; <b>${total - avail - sold}</b> held &nbsp;·&nbsp; ` +
+    `<b>${sold}</b> sold &nbsp;·&nbsp; ledger revenue <b>$${revenue}</b>`;
 }
 
 async function hold(seat) {
@@ -226,8 +230,8 @@ async function hold(seat) {
 async function confirmHold() {
   if (!myHold) return;
   try {
-    await api(`/api/holds/${myHold.holdId}/confirm`, { method: 'POST' });
-    log('Confirmed. Seat sold.', 'ok');
+    const res = await api(`/api/holds/${myHold.holdId}/confirm`, { method: 'POST' });
+    log(`Confirmed. Charged $${(res.amountCents / 100).toFixed(2)} — transfer ${res.transferId.slice(0, 8)}.`, 'ok');
     myHold = null;
   } catch (e) {
     if (e.status === 409) {

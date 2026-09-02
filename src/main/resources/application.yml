@@ -43,6 +43,15 @@ turnstile:
       # while live buyers wait behind them.
       batch-size: 500
 
+  outbox:
+    enabled: true
+    interval: PT2S
+    batch-size: 100
+
+  reconciliation:
+    enabled: true
+    interval: PT1H
+
 logging:
   level:
     com.turnstile: DEBUG

@@ -39,7 +39,9 @@ public class HoldController {
     public record HoldResponse(UUID holdId, UUID seatId, Instant expiresAt) {
     }
 
-    public record ConfirmResponse(UUID holdId, UUID seatId, String state) {
+    public record ConfirmResponse(
+            UUID holdId, UUID seatId, String state,
+            UUID transferId, long amountCents) {
     }
 
     public record HoldStatus(UUID holdId, UUID seatId, String state, Instant expiresAt, long secondsRemaining) {
@@ -66,8 +68,13 @@ public class HoldController {
      */
     @PostMapping("/{holdId}/confirm")
     public ConfirmResponse confirm(@PathVariable UUID holdId) {
-        Hold confirmed = booking.confirm(holdId);
-        return new ConfirmResponse(confirmed.id(), confirmed.seatId(), confirmed.state().name());
+        BookingService.Booking result = booking.confirm(holdId);
+        return new ConfirmResponse(
+                result.hold().id(),
+                result.hold().seatId(),
+                result.hold().state().name(),
+                result.transfer().id(),
+                result.amountCents());
     }
 
     /**

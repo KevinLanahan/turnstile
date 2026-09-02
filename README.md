@@ -20,7 +20,9 @@ That sentence is the entire project. Everything in this repo serves it.
 | M1 | Atomic seat claim, 500-thread contention test, repository contract tests | done |
 | M2 | Redis fast path (Lua), before/after benchmark | done |
 | M3 | Hold expiry, state machine, confirm-vs-expire race test | done |
-| M4 | Payment ledger, idempotency, transactional outbox | planned |
+| M4a | Double-entry ledger, balanced transfers, refunds | done |
+| M4b | Transactional outbox, idempotent consumer, reconciliation | done |
+| M4c | Fake payment gateway and payment state machine | planned |
 | M5 | k6 load test, chaos tests, reconciliation job | planned |
 | M6 | README graphs, architecture diagram, seat-map UI | planned |
 
@@ -148,6 +150,149 @@ Each layer needs a test at its own seam.
 Both run against real Postgres via Testcontainers. Not H2, not a mock. The project
 turns on exact Postgres locking semantics, and a database with different
 concurrency behaviour would happily let broken code pass.
+
+## The outbox and reconciliation (M4b)
+
+### Telling another system what happened
+
+The oldest problem in distributed systems: you must change your database *and*
+tell something else about it, and they are different systems so you cannot do both
+atomically.
+
+| Approach | Failure |
+|---|---|
+| Write DB, then publish | Crash in between and the event is lost forever |
+| Publish, then write DB | Crash in between and you announced something that never happened |
+| Two-phase commit | A cure worse than the disease |
+
+The outbox sidesteps it. The event is written to **this** database in the **same
+transaction** as the business change - so if the booking commits the event exists,
+and if the booking rolls back the event does too. A separate relay then reads the
+table and publishes.
+
+`OutboxTest.aFailedBookingWritesNoEvent` is the test that matters: it kills a hold
+so confirmation loses the race, and asserts the outbox is empty afterwards. A
+"write then publish" design would already have told the world about a booking that
+never happened.
+
+### At-least-once, not exactly-once
+
+The relay publishes, then marks the row delivered - two statements, with a gap. A
+crash in that gap means the event is published again on restart. **That window
+cannot be closed**; closing it is the distributed transaction we were avoiding in
+the first place.
+
+So delivery is at-least-once and the consumer is made idempotent instead.
+`BookingNotifier` claims the event id and performs its side effect in one
+transaction:
+
+```sql
+INSERT INTO consumed_events (consumer, event_id)
+VALUES (?, ?) ON CONFLICT (consumer, event_id) DO NOTHING
+```
+
+A single atomic test-and-set: the first delivery inserts one row, every redelivery
+conflicts and gets zero. Checking "have I seen this?" and then inserting would be
+two statements with a gap, and two threads handed the same redelivered event would
+both slip through it.
+
+**At-least-once delivery plus an idempotent consumer is what people mean when they
+say exactly-once.** There is no exactly-once delivery; there is only
+exactly-once *effect*.
+
+### Reconciliation
+
+Every invariant reconciliation checks is already enforced by a constraint, a
+trigger, or a transaction boundary. Checking again is not redundancy for its own
+sake: enforcement gets bypassed, and **the failure mode of a ledger is silence.**
+Nothing crashes, the numbers are just wrong, and nobody finds out until someone
+counts. This is the thing that counts. Banks run it nightly and treat a non-empty
+report as an incident.
+
+`ReconciliationTest` proves it works by breaking things on purpose - the only way
+such a job is worth testing. A reconciler that has only ever seen healthy data is
+not evidence of anything.
+
+Writing those tests turned up something worth recording. The first attempt to
+inject a global imbalance **failed, because Postgres refused to let it happen** -
+the M4a balance trigger caught it at commit. Which makes the arithmetic obvious: if
+every transfer balances, the global sum is necessarily zero, so a global imbalance
+is *unreachable* while that trigger holds. The check stays anyway, because triggers
+get disabled for bulk loads, skipped by logical replication, or dropped by an
+unreviewed migration - and the test now simulates exactly that by disabling the
+trigger before injecting the drift.
+
+That is the same lesson as M1's seat guard, arrived at from the other direction:
+**defence in depth makes systems safer and tests weaker.** Test each layer at its
+own seam, and be explicit about which failure each one actually defends against.
+
+### Known weakness
+
+`checkBookedSeatsMatchSales` compares global *counts* rather than joining each
+booking to its transfer, because there is no foreign key between them - the only
+link is the `"hold:{id}"` idempotency-key convention. So reconciliation can tell you
+the totals disagree but not **which** booking is wrong, which is exactly what you
+want at 2am. The fix is a real column on `transfers` pointing at the hold. It is
+listed here rather than quietly left out.
+
+## The ledger (M4a)
+
+Confirming a hold books the seat *and* moves the money, in one transaction. There
+is no interleaving in which a customer is charged for a seat they did not get, or
+walks away with a seat nobody was charged for.
+
+Three rules, all enforced by Postgres rather than by Java, because application code
+is where bugs live and this is the part where a bug is measured in dollars.
+
+### 1. Every transfer balances
+
+Money is never created or destroyed, only moved. A purchase debits the customer and
+credits the event by the same amount, and the entries sum to zero.
+
+This cannot be a `CHECK` constraint - a `CHECK` sees one row, and balance is a
+property of a *set* of rows. It is a **deferred constraint trigger** instead,
+running at `COMMIT` rather than per statement:
+
+```sql
+CREATE CONSTRAINT TRIGGER trg_ledger_entries_must_balance
+    AFTER INSERT ON ledger_entries
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION assert_transfer_balances();
+```
+
+Deferred matters. Real posting code writes legs one statement at a time, so the
+books only have to balance at the end. The payoff is that code writing one side of
+a transfer does not produce a subtly wrong balance to be discovered in an audit
+months later - it fails to commit. `LedgerInvariantsTest` writes exactly that
+half-a-transfer and asserts the database refuses it.
+
+Balance is checked per currency, since a transfer moving +100 USD and -100 EUR sums
+to zero and is nonsense.
+
+### 2. Entries are append-only
+
+`UPDATE` and `DELETE` on `ledger_entries` are blocked by triggers. A ledger you can
+edit is a spreadsheet, not a ledger. Mistakes are corrected by posting a reversing
+transfer, which leaves both the error and the correction visible - that is what
+makes it an audit trail. A transfer can be reversed at most once, enforced by a
+partial unique index on `reverses_id`.
+
+*Caveat worth knowing:* `TRUNCATE` does not fire row-level `DELETE` triggers, so it
+slips past this. In a real deployment the application role simply would not hold
+`TRUNCATE` on the table. The tests use it deliberately for cleanup.
+
+### 3. Balances are derived, never stored
+
+There is no `balance` column anywhere. Balances come from summing entries through
+the `account_balances` view, so there is nothing that can drift out of sync with the
+entries that produced it. The seat map's revenue figure is read from that view - if
+it ever disagrees with what was actually sold, the entries are wrong and you want to
+know.
+
+### Money is `BIGINT` cents
+
+Never a float. `0.1 + 0.2` is not `0.3`, and a ledger is the last place to discover
+that.
 
 ## The expiry race (M3)
 

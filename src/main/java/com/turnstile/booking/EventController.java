@@ -5,6 +5,8 @@ import com.turnstile.inventory.Event;
 import com.turnstile.inventory.EventRepository;
 import com.turnstile.inventory.Seat;
 import com.turnstile.inventory.SeatRepository;
+import com.turnstile.ledger.AccountKind;
+import com.turnstile.ledger.LedgerService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -25,10 +27,12 @@ public class EventController {
 
     private final EventRepository events;
     private final SeatRepository seats;
+    private final LedgerService ledger;
 
-    public EventController(EventRepository events, SeatRepository seats) {
+    public EventController(EventRepository events, SeatRepository seats, LedgerService ledger) {
         this.events = events;
         this.seats = seats;
+        this.ledger = ledger;
     }
 
     public record EventSummary(
@@ -41,7 +45,9 @@ public class EventController {
             long priceCents, String status) {
     }
 
-    public record SeatMap(UUID eventId, String name, String venue, List<SeatView> seats) {
+    public record SeatMap(
+            UUID eventId, String name, String venue,
+            long revenueCents, List<SeatView> seats) {
     }
 
     @GetMapping
@@ -64,6 +70,10 @@ public class EventController {
                         seat.priceCents(), seat.status().name()))
                 .toList();
 
-        return new SeatMap(event.id(), event.name(), event.venue(), view);
+        // Read straight off the ledger, not off a stored total. If this number is
+        // wrong, the entries are wrong, and that is exactly what we want to see.
+        long revenue = ledger.balanceOf(AccountKind.EVENT_REVENUE, eventId, "USD");
+
+        return new SeatMap(event.id(), event.name(), event.venue(), revenue, view);
     }
 }
