@@ -7,7 +7,12 @@ services:
       POSTGRES_USER: turnstile
       POSTGRES_PASSWORD: turnstile
     ports:
-      - "5432:5432"
+      # 5432 is very often taken on a developer machine by a native Postgres
+      # install or a leftover container, and the failure mode is nasty: compose
+      # prints one line, the app then connects to whatever IS on 5432, and you
+      # get "password authentication failed" for a database you never meant to
+      # talk to. Default off the beaten path; override with TURNSTILE_PG_PORT.
+      - "${TURNSTILE_PG_PORT:-5434}:5432"
     volumes:
       - turnstile-pgdata:/var/lib/postgresql/data
     healthcheck:

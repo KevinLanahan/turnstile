@@ -3,7 +3,8 @@ spring:
     name: turnstile
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/turnstile
+    # Same env var as docker-compose.yml, so one variable moves both.
+    url: jdbc:postgresql://localhost:${TURNSTILE_PG_PORT:5434}/turnstile
     username: turnstile
     password: turnstile
     hikari:

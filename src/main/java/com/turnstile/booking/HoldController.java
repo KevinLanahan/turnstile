@@ -1,11 +1,14 @@
 package com.turnstile.booking;
 
 import com.turnstile.inventory.Hold;
+import com.turnstile.common.HoldNotFoundException;
+import com.turnstile.inventory.HoldRepository;
 import com.turnstile.inventory.InventoryService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -22,10 +25,12 @@ public class HoldController {
 
     private final InventoryService inventory;
     private final BookingService booking;
+    private final HoldRepository holds;
 
-    public HoldController(InventoryService inventory, BookingService booking) {
+    public HoldController(InventoryService inventory, BookingService booking, HoldRepository holds) {
         this.inventory = inventory;
         this.booking = booking;
+        this.holds = holds;
     }
 
     public record HoldRequest(@NotNull UUID seatId, @NotNull UUID userId) {
@@ -35,6 +40,9 @@ public class HoldController {
     }
 
     public record ConfirmResponse(UUID holdId, UUID seatId, String state) {
+    }
+
+    public record HoldStatus(UUID holdId, UUID seatId, String state, Instant expiresAt, long secondsRemaining) {
     }
 
     /**
@@ -60,5 +68,18 @@ public class HoldController {
     public ConfirmResponse confirm(@PathVariable UUID holdId) {
         Hold confirmed = booking.confirm(holdId);
         return new ConfirmResponse(confirmed.id(), confirmed.seatId(), confirmed.state().name());
+    }
+
+    /**
+     * Hold status, including how long is left. Note that {@code secondsRemaining}
+     * is advisory only - it is a hint for rendering a countdown, not permission to
+     * confirm. Whether a hold is still live is decided by Postgres at the moment
+     * the confirmation actually runs, which is the only clock that matters.
+     */
+    @GetMapping("/{holdId}")
+    public HoldStatus status(@PathVariable UUID holdId) {
+        Hold hold = holds.findById(holdId).orElseThrow(() -> new HoldNotFoundException(holdId));
+        long remaining = Math.max(0, java.time.Duration.between(Instant.now(), hold.expiresAt()).toSeconds());
+        return new HoldStatus(hold.id(), hold.seatId(), hold.state().name(), hold.expiresAt(), remaining);
     }
 }

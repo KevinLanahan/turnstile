@@ -1,0 +1,16 @@
+# Local demo profile:  mvn spring-boot:run -Dspring-boot.run.profiles=dev
+#
+# Timings are compressed so the hold lifecycle is watchable. In production a hold
+# lasts five minutes because that is how long a human needs to enter card details;
+# thirty seconds is how long a human needs to watch a hold expire.
+
+turnstile:
+  hold:
+    ttl: PT30S
+    sweep:
+      enabled: true
+      interval: PT2S
+
+logging:
+  level:
+    com.turnstile: DEBUG

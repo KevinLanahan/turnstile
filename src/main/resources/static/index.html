@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turnstile</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --line: #262b36;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --available: #2a3140;
+    --available-hover: #37455e;
+    --mine: #d99b3d;
+    --taken: #1b1e25;
+    --booked: #3f6d4e;
+    --danger: #c85a54;
+    --accent: #6ea8fe;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 60px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header { margin-bottom: 28px; }
+  h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .counts { margin-top: 10px; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .counts b { color: var(--text); }
+
+  .stage {
+    margin: 26px 0 18px; padding: 9px; text-align: center;
+    background: linear-gradient(180deg, var(--panel), transparent);
+    border-top: 2px solid var(--line);
+    border-radius: 0 0 40% 40% / 0 0 22px 22px;
+    color: var(--muted); font-size: 11px; letter-spacing: 0.18em;
+  }
+
+  .rows { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .rowlabel { width: 18px; color: var(--muted); font-size: 12px; text-align: center; }
+  .seat {
+    width: 34px; height: 30px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--available); color: var(--muted);
+    font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    cursor: pointer; transition: background .12s, transform .12s;
+  }
+  .seat:hover:not(:disabled) { background: var(--available-hover); transform: translateY(-1px); }
+  .seat:disabled { cursor: not-allowed; }
+  .seat.taken  { background: var(--taken); color: #4a5162; border-color: #20242d; }
+  .seat.booked { background: var(--booked); color: #dff0e4; border-color: #4c8560; }
+  .seat.mine   { background: var(--mine); color: #241802; border-color: #f0bd67; font-weight: 700; }
+
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 22px; color: var(--muted); font-size: 12px; }
+  .legend span { display: flex; gap: 6px; align-items: center; }
+  .chip { width: 13px; height: 13px; border-radius: 4px; border: 1px solid var(--line); display: inline-block; }
+
+  .panel {
+    margin-top: 26px; padding: 16px 18px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-variant-numeric: tabular-nums; }
+  .kv span:first-child { color: var(--muted); }
+  .countdown.urgent { color: var(--danger); font-weight: 700; }
+  button.action {
+    margin-top: 12px; width: 100%; padding: 10px;
+    background: var(--accent); color: #06122b; border: 0; border-radius: 8px;
+    font-size: 14px; font-weight: 650; cursor: pointer;
+  }
+  button.action:hover { filter: brightness(1.08); }
+  button.action.secondary { background: transparent; color: var(--muted); border: 1px solid var(--line); margin-top: 8px; }
+
+  #log { margin-top: 22px; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #log div { padding: 5px 10px; border-left: 2px solid var(--line); color: var(--muted); }
+  #log div.ok   { border-color: var(--booked); color: #a9d7b8; }
+  #log div.warn { border-color: var(--mine);   color: #e6c48a; }
+  #log div.err  { border-color: var(--danger); color: #e8a5a1; }
+  .empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="eventName">Loading…</h1>
+    <div class="sub" id="eventVenue"></div>
+    <div class="counts" id="counts"></div>
+  </header>
+
+  <div class="stage">STAGE</div>
+  <div class="rows" id="rows"></div>
+
+  <div class="legend">
+    <span><i class="chip" style="background:var(--available)"></i> Available</span>
+    <span><i class="chip" style="background:var(--mine)"></i> Your hold</span>
+    <span><i class="chip" style="background:var(--taken)"></i> Held by someone else</span>
+    <span><i class="chip" style="background:var(--booked)"></i> Sold</span>
+  </div>
+
+  <div class="panel" id="holdPanel">
+    <h2>Your hold</h2>
+    <div id="holdBody" class="empty">Pick a seat to hold it.</div>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<script>
+// Deliberately in-memory: reloading the page makes you a new customer, which is
+// handy for racing yourself in two browser windows.
+const USER_ID = crypto.randomUUID();
+
+let eventId = null;
+let myHold = null;      // { holdId, seatId, expiresAt }
+let seatsById = new Map();
+
+const $ = id => document.getElementById(id);
+
+function log(msg, kind) {
+  const el = document.createElement('div');
+  if (kind) el.className = kind;
+  el.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').prepend(el);
+  while ($('log').childElementCount > 14) $('log').lastElementChild.remove();
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const body = res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) {
+    const err = new Error((body && (body.detail || body.title)) || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+async function loadEvent() {
+  const events = await api('/api/events');
+  if (!events.length) {
+    $('eventName').textContent = 'No events';
+    $('eventVenue').textContent = 'Start the app with the dev profile to seed one.';
+    return false;
+  }
+  eventId = events[0].id;
+  $('eventName').textContent = events[0].name;
+  $('eventVenue').textContent = events[0].venue;
+  return true;
+}
+
+async function refreshSeats() {
+  if (!eventId) return;
+  const map = await api(`/api/events/${eventId}/seats`);
+  seatsById = new Map(map.seats.map(s => [s.id, s]));
+
+  const byRow = new Map();
+  for (const seat of map.seats) {
+    if (!byRow.has(seat.row)) byRow.set(seat.row, []);
+    byRow.get(seat.row).push(seat);
+  }
+
+  const rows = $('rows');
+  rows.textContent = '';
+  for (const [rowLabel, seats] of byRow) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'row';
+    const label = document.createElement('div');
+    label.className = 'rowlabel';
+    label.textContent = rowLabel;
+    rowEl.append(label);
+
+    for (const seat of seats) {
+      const b = document.createElement('button');
+      b.className = 'seat';
+      b.textContent = seat.number;
+      const isMine = myHold && myHold.seatId === seat.id;
+
+      if (seat.status === 'BOOKED') {
+        b.classList.add('booked'); b.disabled = true;
+        b.title = 'Sold';
+      } else if (seat.status === 'HELD') {
+        b.classList.add(isMine ? 'mine' : 'taken');
+        b.disabled = true;
+        b.title = isMine ? 'Your hold' : 'Held by someone else';
+      } else {
+        b.title = `$${(seat.priceCents / 100).toFixed(2)}`;
+        b.onclick = () => hold(seat);
+      }
+      rowEl.append(b);
+    }
+    rows.append(rowEl);
+  }
+
+  const total = map.seats.length;
+  const avail = map.seats.filter(s => s.status === 'AVAILABLE').length;
+  const sold  = map.seats.filter(s => s.status === 'BOOKED').length;
+  $('counts').innerHTML =
+    `<b>${avail}</b> available &nbsp;·&nbsp; <b>${total - avail - sold}</b> held &nbsp;·&nbsp; <b>${sold}</b> sold`;
+}
+
+async function hold(seat) {
+  try {
+    const res = await api('/api/holds', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+      body: JSON.stringify({ seatId: seat.id, userId: USER_ID })
+    });
+    myHold = { holdId: res.holdId, seatId: res.seatId, expiresAt: new Date(res.expiresAt) };
+    log(`Held ${seat.row}${seat.number}. Confirm before it expires.`, 'ok');
+  } catch (e) {
+    if (e.status === 409) {
+      log(`Seat ${seat.row}${seat.number} — someone beat you to it (409).`, 'warn');
+    } else {
+      log(`Hold failed: ${e.message}`, 'err');
+    }
+  }
+  await refreshSeats();
+  renderHold();
+}
+
+async function confirmHold() {
+  if (!myHold) return;
+  try {
+    await api(`/api/holds/${myHold.holdId}/confirm`, { method: 'POST' });
+    log('Confirmed. Seat sold.', 'ok');
+    myHold = null;
+  } catch (e) {
+    if (e.status === 409) {
+      // The expiry sweeper got there first. This is the M3 race, live.
+      log('Too late — the hold expired before the confirmation landed (409).', 'err');
+      myHold = null;
+    } else {
+      log(`Confirm failed: ${e.message}`, 'err');
+    }
+  }
+  await refreshSeats();
+  renderHold();
+}
+
+function renderHold() {
+  const body = $('holdBody');
+  if (!myHold) {
+    body.className = 'empty';
+    body.textContent = 'Pick a seat to hold it.';
+    return;
+  }
+  const seat = seatsById.get(myHold.seatId);
+  const left = Math.max(0, Math.round((myHold.expiresAt - new Date()) / 1000));
+  body.className = '';
+  body.innerHTML = `
+    <div class="kv"><span>Seat</span><span>${seat ? seat.row + seat.number : '—'}</span></div>
+    <div class="kv"><span>Price</span><span>${seat ? '$' + (seat.priceCents / 100).toFixed(2) : '—'}</span></div>
+    <div class="kv"><span>Expires in</span><span class="countdown ${left <= 10 ? 'urgent' : ''}">${left}s</span></div>`;
+
+  const confirm = document.createElement('button');
+  confirm.className = 'action';
+  confirm.textContent = 'Confirm and pay';
+  confirm.onclick = confirmHold;
+  body.append(confirm);
+
+  const abandon = document.createElement('button');
+  abandon.className = 'action secondary';
+  abandon.textContent = 'Walk away (let it expire)';
+  abandon.onclick = () => {
+    log('Abandoned. The sweeper will return the seat to the pool.', 'warn');
+    myHold = null;
+    renderHold();
+  };
+  body.append(abandon);
+}
+
+(async function start() {
+  if (!(await loadEvent())) return;
+  await refreshSeats();
+  renderHold();
+  log(`You are customer ${USER_ID.slice(0, 8)}. Open a second window to race yourself.`);
+
+  // Poll so expiries performed by the server sweeper appear without a reload.
+  setInterval(async () => {
+    if (myHold && myHold.expiresAt <= new Date()) {
+      log('Your hold lapsed. The sweeper is about to reclaim the seat.', 'warn');
+      myHold = null;
+    }
+    await refreshSeats();
+    renderHold();
+  }, 2000);
+  setInterval(renderHold, 1000);
+})();
+</script>
+</body>
+</html>

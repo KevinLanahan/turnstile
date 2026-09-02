@@ -30,9 +30,14 @@ See [DESIGN.md](DESIGN.md) for the full design and rationale.
 
 Requires **JDK 21** and **Docker** (the test suite starts real Postgres containers).
 
+Postgres is published on host port **5434**, not 5432, because 5432 is so often
+already taken. Set `TURNSTILE_PG_PORT` to move it - the same variable is read by
+`docker-compose.yml` and by the application.
+
 ```bash
-# infrastructure
+# infrastructure - check both containers actually came up
 docker compose up -d
+docker compose ps
 
 # the whole suite, including the contention test
 mvn test

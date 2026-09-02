@@ -103,6 +103,15 @@ public class SeatRepository {
                 .findFirst();
     }
 
+    /** Every seat for an event, whatever its status - the seat map read path. */
+    public List<Seat> findByEvent(UUID eventId) {
+        return jdbc.query("""
+                SELECT * FROM seats
+                 WHERE event_id = ?
+                 ORDER BY section, row_label, seat_number
+                """, SEAT_MAPPER, eventId);
+    }
+
     public List<Seat> findAvailableByEvent(UUID eventId) {
         return jdbc.query("""
                 SELECT * FROM seats
