@@ -35,6 +35,12 @@ server:
 turnstile:
   hold:
     ttl: PT5M
+    sweep:
+      enabled: true
+      interval: PT10S
+      # Bounded so one sweep cannot hold thousands of row locks in sequence
+      # while live buyers wait behind them.
+      batch-size: 500
 
 logging:
   level:

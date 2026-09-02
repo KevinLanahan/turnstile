@@ -78,6 +78,25 @@ public class SeatRepository {
                 """, seatId, holdId);
     }
 
+    /**
+     * Promotes a held seat to sold. Guarded on the owning hold id so a confirmation
+     * can never book a seat that has since been released and re-claimed by someone
+     * else.
+     *
+     * @return 1 if booked, 0 if the seat was no longer held by this hold
+     */
+    public int book(UUID seatId, UUID holdId) {
+        return jdbc.update("""
+                UPDATE seats
+                   SET status     = 'BOOKED',
+                       version    = version + 1,
+                       updated_at = now()
+                 WHERE id      = ?
+                   AND hold_id = ?
+                   AND status  = 'HELD'
+                """, seatId, holdId);
+    }
+
     public Optional<Seat> findById(UUID seatId) {
         return jdbc.query("SELECT * FROM seats WHERE id = ?", SEAT_MAPPER, seatId)
                 .stream()

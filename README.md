@@ -19,7 +19,7 @@ That sentence is the entire project. Everything in this repo serves it.
 | M0 | Project skeleton, Docker Compose, migrations, Testcontainers | done |
 | M1 | Atomic seat claim, 500-thread contention test, repository contract tests | done |
 | M2 | Redis fast path (Lua), before/after benchmark | done |
-| M3 | Hold expiry, state machine, confirm-vs-expire race test | planned |
+| M3 | Hold expiry, state machine, confirm-vs-expire race test | done |
 | M4 | Payment ledger, idempotency, transactional outbox | planned |
 | M5 | k6 load test, chaos tests, reconciliation job | planned |
 | M6 | README graphs, architecture diagram, seat-map UI | planned |
@@ -143,6 +143,69 @@ Each layer needs a test at its own seam.
 Both run against real Postgres via Testcontainers. Not H2, not a mock. The project
 turns on exact Postgres locking semantics, and a database with different
 concurrency behaviour would happily let broken code pass.
+
+## The expiry race (M3)
+
+Holds expire after five minutes so an abandoned checkout does not remove a seat
+from sale forever. That creates the nastiest correctness problem in the project:
+a payment confirming at the exact millisecond the sweeper decides the hold is dead.
+
+Done naively you either charge a card and then hand the seat to somebody else, or
+release a seat that has just been paid for. Both produce a support ticket rather
+than a stack trace, which is the worst kind of bug.
+
+**The race is arbitrated on the hold, not the seat.** Confirmation and expiry are
+both conditional updates against the same `holds` row:
+
+```sql
+-- confirm
+UPDATE holds SET state = 'CONFIRMED'
+ WHERE id = ? AND state = 'ACTIVE' AND expires_at >  now();
+
+-- expire
+UPDATE holds SET state = 'EXPIRED'
+ WHERE id = ? AND state = 'ACTIVE' AND expires_at <= now();
+```
+
+Postgres serialises them on that row's lock, so whichever arrives second
+re-evaluates `state = 'ACTIVE'` against the committed result of the first and
+matches nothing. Same mechanism as the seat claim in M1, pointed at a different
+row. Only after winning the hold does either side touch the seat, inside the same
+transaction, so a loser changes nothing at all.
+
+`now()` is deliberately evaluated by Postgres rather than by the application. Two
+app servers with skewed clocks would otherwise disagree about whether a hold is
+dead, and the seat would be both sold and released.
+
+### Three legal outcomes, not two
+
+`HoldExpiryRaceTest` runs 200 races with the deadline placed before, after, and
+exactly at the moment both operations fire. It deliberately does **not** assert
+that exactly one side wins, because that is false:
+
+1. **Confirm wins** - hold `CONFIRMED`, seat `BOOKED`.
+2. **Expiry wins** - hold `EXPIRED`, seat `AVAILABLE`.
+3. **Neither wins** - the sweeper ran a hair early (hold not yet due, matches
+   nothing) *and* the confirmation landed a hair late (deadline passed, matches
+   nothing). The hold is untouched, stays `ACTIVE`, and the next sweep collects it.
+
+The third case is real, correct, and easy to miss. A test asserting
+exactly-one-winner would fail intermittently against a perfectly healthy system.
+
+What the test actually asserts is the invariant that must never break: **hold state
+and seat status always agree.** A `CONFIRMED` hold whose seat is `AVAILABLE`, or an
+`EXPIRED` hold whose seat is `BOOKED`, means money and inventory have diverged. It
+also asserts both winners are reachable across the run, so the suite can never
+quietly stop exercising one branch.
+
+### The sweeper
+
+One transaction per hold, not one per batch. Sweeping a thousand holds in a single
+transaction would hold a thousand row locks for its duration - blocking live buyers
+on every one of those seats - and one failure would roll back the lot. The Redis
+availability mark is dropped only after the expiring transaction commits; dropping
+it first would let the fast path wave through requests for a seat whose expiry then
+rolled back.
 
 ## Performance: what the Redis fast path bought (M2)
 
