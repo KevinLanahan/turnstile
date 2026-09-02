@@ -23,8 +23,12 @@ That sentence is the entire project. Everything in this repo serves it.
 | M4a | Double-entry ledger, balanced transfers, refunds | done |
 | M4b | Transactional outbox, idempotent consumer, reconciliation | done |
 | M4c | Fake payment gateway and payment state machine | planned |
-| M5 | k6 load test, chaos tests, reconciliation job | planned |
-| M6 | README graphs, architecture diagram, seat-map UI | planned |
+
+The demo UI and the reconciliation job were both pulled forward out of later
+milestones, so those rows are smaller than they look.
+| M5a | Chaos tests: relay crash, Redis outage | done |
+| M5b | k6 end-to-end load test | planned |
+| M6 | Architecture diagram, README graphs (seat-map UI landed early, see below) | planned |
 
 See [DESIGN.md](DESIGN.md) for the full design and rationale.
 
@@ -150,6 +154,76 @@ Each layer needs a test at its own seam.
 Both run against real Postgres via Testcontainers. Not H2, not a mock. The project
 turns on exact Postgres locking semantics, and a database with different
 concurrency behaviour would happily let broken code pass.
+
+## Chaos tests (M5a)
+
+Two dependencies, deliberately broken, with the system asserted to degrade rather
+than fail. These are the tests that turn design claims into evidence.
+
+### The relay dies at the worst possible moment
+
+There is one unavoidable window in the outbox pattern: the relay publishes an
+event, then dies before it can record that it did. On restart it publishes again.
+Closing that window would require a distributed transaction across the database
+and the broker - the exact thing the outbox exists to avoid.
+
+So the design does not prevent duplicates, it makes them harmless.
+`RelayCrashChaosTest` forces the window open on **every single event**:
+
+| | Result |
+|---|--:|
+| Bookings | 40 |
+| Forced crashes after publish | 40 |
+| Events lost | **0** |
+| Deliveries handed to the consumer | 120 |
+| Side effects performed | **40** |
+
+Three deliveries per event, one confirmation per customer. A consumer without the
+`consumed_events` claim would have sent all 120.
+
+### Redis disappears mid-flight
+
+The M2 fast path is an optimisation, not a source of truth, and everything rests
+on that distinction. A cache that failed **closed** would turn a Redis outage into
+a total outage - every seat looking unavailable, legitimate customers rejected,
+while a perfectly healthy database sat idle.
+
+`RedisOutageChaosTest` supplies a comprehensively dead Redis as a `@Primary` bean,
+so the real booking path runs with no cache underneath it:
+
+| | Result |
+|---|--:|
+| Bookings attempted with Redis down | 50 |
+| Bookings that succeeded | **50** |
+| Requests that fell through to Postgres | 50 |
+| Threads contending for one seat | 200 |
+| Winners | **1** |
+| Oversells | **0** |
+
+The second half is the one that matters. **With the cache entirely gone, 200
+concurrent threads still produce exactly one winner** - because correctness never
+lived in Redis. It lives in a conditional `UPDATE` in Postgres, and the cache was
+only ever saving connections.
+
+An outage costs throughput. It does not cost correctness, and it does not reject a
+customer the database would have accepted.
+
+### How the faults are injected
+
+At the client boundary - a publisher that throws after delivering, a Redis template
+that errors - rather than by severing real network connections with something like
+Toxiproxy. The assertions are identical, because what is under test is this
+system's reaction rather than the driver's. A network-level version would be more
+faithful and is the obvious next step, listed here rather than glossed over.
+
+### What these tests found
+
+Writing them surfaced a real bug: `OutboxRelay` logged a full stack trace on every
+publish failure. Forty forced crashes produced forty stack traces, and a genuine
+broker outage would have produced one per event per retry pass indefinitely -
+taking the log pipeline down alongside the broker. It now logs the first failure in
+full and one summary line per hundred, matching the Redis fast path, which had the
+identical bug found the identical way.
 
 ## The outbox and reconciliation (M4b)
 

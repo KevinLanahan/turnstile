@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Reads committed events out of the outbox and publishes them.
@@ -22,6 +23,14 @@ public class OutboxRelay {
     private final OutboxRepository outbox;
     private final EventPublisher publisher;
     private final int batchSize;
+
+    /**
+     * Consecutive publish failures. The failure mode this class is built for is
+     * "the broker is down", which means failures arrive continuously rather than
+     * once - and a stack trace per failed event per retry pass would take the log
+     * pipeline down alongside the broker.
+     */
+    private final AtomicLong consecutiveFailures = new AtomicLong();
 
     public OutboxRelay(OutboxRepository outbox,
                        EventPublisher publisher,
@@ -49,6 +58,7 @@ public class OutboxRelay {
                 // this event is delivered again after restart. That is at-least-once,
                 // and it is why the consumer records what it has already handled.
                 outbox.markPublished(event.id());
+                consecutiveFailures.set(0);
                 published++;
             } catch (RuntimeException ex) {
                 // Leave published_at NULL so it is retried on the next pass. Ordering
@@ -56,11 +66,30 @@ public class OutboxRelay {
                 // failing event will block the ones behind it - in production this is
                 // where a dead-letter threshold on `attempts` belongs.
                 outbox.recordFailure(event.id(), ex.toString());
-                log.warn("Failed to publish outbox event {} (attempt {}), will retry",
-                        event.id(), event.attempts() + 1, ex);
+                noteFailure(event, ex);
                 break;
             }
         }
         return published;
+    }
+
+    /**
+     * Full detail on the first failure, then one summary line per hundred. Enough
+     * to diagnose, not enough to drown in.
+     */
+    private void noteFailure(OutboxEvent event, RuntimeException ex) {
+        long failures = consecutiveFailures.incrementAndGet();
+        if (failures == 1) {
+            log.warn("Failed to publish outbox event {} (attempt {}); will retry. "
+                    + "Further failures will be summarised.", event.id(), event.attempts() + 1, ex);
+        } else if (failures % 100 == 0) {
+            log.warn("Outbox delivery still failing: {} consecutive failures, {} events pending.",
+                    failures, outbox.unpublishedCount());
+        }
+    }
+
+    /** Consecutive publish failures; zero means delivery is healthy. */
+    public long consecutiveFailures() {
+        return consecutiveFailures.get();
     }
 }
